@@ -1,5 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { metrics as otelMetrics, type Meter as OtelMeter } from '@opentelemetry/api'
 import { Meter, AgentMetrics } from '../meter.js'
+import { MockMeter } from '../../__fixtures__/mock-meter.js'
 import type { ToolUse } from '../../tools/types.js'
 
 describe('Meter', () => {
@@ -143,7 +145,8 @@ describe('Meter', () => {
 
   describe('startCycle', () => {
     it('returns cycle id and start time', () => {
-      vi.spyOn(Date, 'now').mockReturnValue(100_000)
+      vi.useFakeTimers()
+      vi.setSystemTime(100_000)
 
       const result = meter.startCycle()
 
@@ -152,7 +155,7 @@ describe('Meter', () => {
         startTime: 100_000,
       })
       expect(meter.metrics.cycleCount).toBe(1)
-      vi.restoreAllMocks()
+      vi.useRealTimers()
     })
 
     it('adds cycle entry to the latest invocation', () => {
@@ -174,14 +177,37 @@ describe('Meter', () => {
 
   describe('endCycle', () => {
     it('records duration on the latest cycle', () => {
-      vi.spyOn(Date, 'now').mockReturnValue(200_000)
+      vi.useFakeTimers()
+      vi.setSystemTime(200_000)
 
       meter.startNewInvocation()
       meter.startCycle()
       meter.endCycle(100_000)
 
       expect(meter.metrics.latestAgentInvocation!.cycles[0]!.duration).toBe(100_000)
-      vi.restoreAllMocks()
+      vi.useRealTimers()
+    })
+
+    it('does not fail when no invocation exists', () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(200_000)
+
+      meter.startCycle()
+
+      expect(() => meter.endCycle(100_000)).not.toThrow()
+      expect(meter.metrics.agentInvocations).toStrictEqual([])
+      vi.useRealTimers()
+    })
+
+    it('does not fail when invocation has no cycles', () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(200_000)
+
+      meter.startNewInvocation()
+
+      expect(() => meter.endCycle(100_000)).not.toThrow()
+      expect(meter.metrics.latestAgentInvocation!.cycles).toStrictEqual([])
+      vi.useRealTimers()
     })
   })
 
@@ -389,6 +415,106 @@ describe('Meter', () => {
       })
     })
   })
+
+  describe('OTEL instrument emission', () => {
+    let mockMeter: MockMeter
+
+    beforeEach(() => {
+      mockMeter = new MockMeter()
+      vi.spyOn(otelMetrics, 'getMeter').mockReturnValue(mockMeter as unknown as OtelMeter)
+    })
+
+    it('emits invocation counter on startNewInvocation', () => {
+      const m = new Meter()
+
+      m.startNewInvocation()
+
+      expect(mockMeter.getCounter('gen_ai.agent.invocation.count')?.sum).toBe(1)
+    })
+
+    it('emits cycle counter on startCycle', () => {
+      const m = new Meter()
+
+      m.startCycle()
+
+      expect(mockMeter.getCounter('gen_ai.agent.cycle.count')?.sum).toBe(1)
+    })
+
+    it('emits cycle duration histogram on endCycle', () => {
+      vi.useFakeTimers()
+      vi.setSystemTime(5000)
+      const m = new Meter()
+
+      m.endCycle(3000)
+
+      expect(mockMeter.getHistogram('gen_ai.agent.cycle.duration')?.sum).toBe(2000)
+      vi.useRealTimers()
+    })
+
+    it('emits tool call counter and duration on successful endToolCall', () => {
+      const m = new Meter()
+
+      m.endToolCall({ tool: makeTool('search', 'id-1'), duration: 150, success: true })
+
+      expect(mockMeter.getCounter('gen_ai.agent.tool.call.count')?.dataPoints).toStrictEqual([
+        { value: 1, attributes: { 'gen_ai.tool.name': 'search' } },
+      ])
+      expect(mockMeter.getHistogram('gen_ai.agent.tool.duration')?.dataPoints).toStrictEqual([
+        { value: 150, attributes: { 'gen_ai.tool.name': 'search' } },
+      ])
+      expect(mockMeter.getCounter('gen_ai.agent.tool.error.count')?.dataPoints).toStrictEqual([])
+    })
+
+    it('emits tool call counter, error counter, and duration on failed endToolCall', () => {
+      const m = new Meter()
+
+      m.endToolCall({ tool: makeTool('search', 'id-1'), duration: 50, success: false })
+
+      expect(mockMeter.getCounter('gen_ai.agent.tool.call.count')?.dataPoints).toStrictEqual([
+        { value: 1, attributes: { 'gen_ai.tool.name': 'search' } },
+      ])
+      expect(mockMeter.getCounter('gen_ai.agent.tool.error.count')?.dataPoints).toStrictEqual([
+        { value: 1, attributes: { 'gen_ai.tool.name': 'search' } },
+      ])
+      expect(mockMeter.getHistogram('gen_ai.agent.tool.duration')?.dataPoints).toStrictEqual([
+        { value: 50, attributes: { 'gen_ai.tool.name': 'search' } },
+      ])
+    })
+
+    it('emits input token counter, output token counter, and model latency on updateCycle', () => {
+      const m = new Meter()
+
+      m.updateCycle({
+        type: 'modelMetadataEvent',
+        usage: { inputTokens: 100, outputTokens: 50, totalTokens: 150 },
+        metrics: { latencyMs: 200 },
+      })
+
+      expect(mockMeter.getCounter('gen_ai.agent.tokens.input')?.sum).toBe(100)
+      expect(mockMeter.getCounter('gen_ai.agent.tokens.output')?.sum).toBe(50)
+      expect(mockMeter.getHistogram('gen_ai.agent.model.latency')?.sum).toBe(200)
+    })
+
+    it('does not emit token counters or latency when updateCycle has no usage or metrics', () => {
+      const m = new Meter()
+
+      m.updateCycle({ type: 'modelMetadataEvent' })
+
+      expect(mockMeter.getCounter('gen_ai.agent.tokens.input')?.dataPoints).toStrictEqual([])
+      expect(mockMeter.getCounter('gen_ai.agent.tokens.output')?.dataPoints).toStrictEqual([])
+      expect(mockMeter.getHistogram('gen_ai.agent.model.latency')?.dataPoints).toStrictEqual([])
+    })
+
+    it('does not emit any OTEL instruments when updateCycle is called with undefined', () => {
+      const m = new Meter()
+
+      m.updateCycle(undefined)
+
+      expect(mockMeter.getCounter('gen_ai.agent.tokens.input')?.dataPoints).toStrictEqual([])
+      expect(mockMeter.getCounter('gen_ai.agent.tokens.output')?.dataPoints).toStrictEqual([])
+      expect(mockMeter.getHistogram('gen_ai.agent.model.latency')?.dataPoints).toStrictEqual([])
+    })
+  })
 })
 
 describe('AgentMetrics', () => {
@@ -554,6 +680,30 @@ describe('AgentMetrics', () => {
           successRate: 0.5,
         },
       })
+    })
+
+    it('toolUsage returns 0 for averageTime and successRate when callCount is 0', () => {
+      const metrics = new AgentMetrics({
+        toolMetrics: {
+          broken: { callCount: 0, successCount: 0, errorCount: 0, totalTime: 0 },
+        },
+      })
+
+      expect(metrics.toolUsage).toStrictEqual({
+        broken: {
+          callCount: 0,
+          successCount: 0,
+          errorCount: 0,
+          totalTime: 0,
+          averageTime: 0,
+          successRate: 0,
+        },
+      })
+    })
+
+    it('totalDuration returns 0 when no invocations exist', () => {
+      const metrics = new AgentMetrics()
+      expect(metrics.totalDuration).toBe(0)
     })
   })
 })
