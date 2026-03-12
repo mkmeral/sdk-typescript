@@ -1,0 +1,494 @@
+name: Secure Integration test
+
+on:
+  pull_request_target:
+    branches: [main]
+  merge_group: # Run tests in merge queue
+    types: [checks_requested]
+
+jobs:
+  authorization-check:
+    name: Check access
+    permissions: read-all
+    runs-on: ubuntu-latest
+    outputs:
+      approval-env: ${{ steps.auth.outputs.approval-env }}
+    steps:
+      - name: Check Authorization
+        id: auth
+        uses: strands-agents/devtools/authorization-check@main
+        with:
+          skip-check: ${{ github.event_name == 'merge_group' }}
+          username: ${{ github.event.pull_request.user.login || 'invalid' }}
+          allowed-roles: 'triage,write,admin'
+
+  # ---------------------------------------------------------------------------
+  # Detect which source areas changed so we only run the relevant test groups.
+  # Uses dorny/paths-filter (GitHub API mode) – no checkout needed.
+  # For merge_group events the filter is skipped and every group runs.
+  # ---------------------------------------------------------------------------
+  detect-changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      models: ${{ github.event_name == 'merge_group' || steps.filter.outputs.models == 'true' || steps.filter.outputs.run-all == 'true' }}
+      mcp: ${{ github.event_name == 'merge_group' || steps.filter.outputs.mcp == 'true' || steps.filter.outputs.run-all == 'true' }}
+      tools: ${{ github.event_name == 'merge_group' || steps.filter.outputs.tools == 'true' || steps.filter.outputs.run-all == 'true' }}
+      multiagent: ${{ github.event_name == 'merge_group' || steps.filter.outputs.multiagent == 'true' || steps.filter.outputs.run-all == 'true' }}
+      agent-core: ${{ github.event_name == 'merge_group' || steps.filter.outputs.agent-core == 'true' || steps.filter.outputs.hooks-plugins == 'true' || steps.filter.outputs.run-all == 'true' }}
+      session: ${{ github.event_name == 'merge_group' || steps.filter.outputs.session == 'true' || steps.filter.outputs.run-all == 'true' }}
+      telemetry: ${{ github.event_name == 'merge_group' || steps.filter.outputs.telemetry == 'true' || steps.filter.outputs.run-all == 'true' }}
+    steps:
+      - name: Detect changes
+        if: github.event_name != 'merge_group'
+        uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            models:
+              - 'src/models/**'
+            mcp:
+              - 'src/mcp.ts'
+            tools:
+              - 'src/tools/**'
+              - 'src/vended-tools/**'
+            multiagent:
+              - 'src/multiagent/**'
+              - 'src/a2a/**'
+            agent-core:
+              - 'src/agent/**'
+              - 'src/conversation-manager/**'
+              - 'src/index.ts'
+              - 'src/errors.ts'
+              - 'src/app-state.ts'
+            hooks-plugins:
+              - 'src/hooks/**'
+              - 'src/plugins/**'
+            session:
+              - 'src/session/**'
+            telemetry:
+              - 'src/telemetry/**'
+            run-all:
+              - 'src/types/**'
+              - 'src/utils/**'
+              - 'src/logging/**'
+              - 'src/registry/**'
+              - 'src/structured-output/**'
+              - 'src/mime.ts'
+              - '.github/workflows/integration-test.yml'
+              - 'test/integ/**'
+              - 'package.json'
+              - 'vitest.config.ts'
+              - 'tsconfig.base.json'
+              - 'src/tsconfig.json'
+
+  # ---------------------------------------------------------------------------
+  # Test group jobs – each only runs when its source area was touched.
+  # ---------------------------------------------------------------------------
+
+  test-models:
+    name: 'Integration tests: models'
+    runs-on: ubuntu-latest
+    needs: [authorization-check, detect-changes]
+    if: needs.detect-changes.outputs.models == 'true'
+    environment: ${{ needs.authorization-check.outputs.approval-env }}
+    permissions:
+      id-token: write
+      pull-requests: read
+      contents: read
+    steps:
+      - name: Configure Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      - name: Checkout head commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm run test:browser:install
+
+      - name: Build the package
+        run: npm run build
+
+      - name: Run integration tests
+        run: npx vitest run --project integ-node --project integ-browser test/integ/models/
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-integ-models
+          path: ./test/.artifacts/
+          retention-days: 4
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  test-mcp:
+    name: 'Integration tests: mcp'
+    runs-on: ubuntu-latest
+    needs: [authorization-check, detect-changes]
+    if: needs.detect-changes.outputs.mcp == 'true'
+    environment: ${{ needs.authorization-check.outputs.approval-env }}
+    permissions:
+      id-token: write
+      pull-requests: read
+      contents: read
+    steps:
+      - name: Configure Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      - name: Checkout head commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build the package
+        run: npm run build
+
+      - name: Run integration tests
+        run: npx vitest run --project integ-node test/integ/mcp/
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-integ-mcp
+          path: ./test/.artifacts/
+          retention-days: 4
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  test-tools:
+    name: 'Integration tests: tools'
+    runs-on: ubuntu-latest
+    needs: [authorization-check, detect-changes]
+    if: needs.detect-changes.outputs.tools == 'true'
+    environment: ${{ needs.authorization-check.outputs.approval-env }}
+    permissions:
+      id-token: write
+      pull-requests: read
+      contents: read
+    steps:
+      - name: Configure Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      - name: Checkout head commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm run test:browser:install
+
+      - name: Build the package
+        run: npm run build
+
+      - name: Run integration tests
+        run: npx vitest run --project integ-node --project integ-browser test/integ/tools/
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-integ-tools
+          path: ./test/.artifacts/
+          retention-days: 4
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  test-multiagent:
+    name: 'Integration tests: multiagent'
+    runs-on: ubuntu-latest
+    needs: [authorization-check, detect-changes]
+    if: needs.detect-changes.outputs.multiagent == 'true'
+    environment: ${{ needs.authorization-check.outputs.approval-env }}
+    permissions:
+      id-token: write
+      pull-requests: read
+      contents: read
+    steps:
+      - name: Configure Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      - name: Checkout head commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm run test:browser:install
+
+      - name: Build the package
+        run: npm run build
+
+      - name: Run integration tests
+        run: npx vitest run --project integ-node --project integ-browser test/integ/multiagent/ test/integ/a2a/
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-integ-multiagent
+          path: ./test/.artifacts/
+          retention-days: 4
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  test-agent-core:
+    name: 'Integration tests: agent-core'
+    runs-on: ubuntu-latest
+    needs: [authorization-check, detect-changes]
+    if: needs.detect-changes.outputs.agent-core == 'true'
+    environment: ${{ needs.authorization-check.outputs.approval-env }}
+    permissions:
+      id-token: write
+      pull-requests: read
+      contents: read
+    steps:
+      - name: Configure Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      - name: Checkout head commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: |
+          npm install
+          npm run test:browser:install
+
+      - name: Build the package
+        run: npm run build
+
+      - name: Run integration tests
+        run: >
+          npx vitest run --project integ-node --project integ-browser
+          test/integ/agent.test.ts
+          test/integ/environment.test.ts
+          test/integ/environment.test.node.ts
+          test/integ/environment.test.browser.ts
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-integ-agent-core
+          path: ./test/.artifacts/
+          retention-days: 4
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  test-session:
+    name: 'Integration tests: session'
+    runs-on: ubuntu-latest
+    needs: [authorization-check, detect-changes]
+    if: needs.detect-changes.outputs.session == 'true'
+    environment: ${{ needs.authorization-check.outputs.approval-env }}
+    permissions:
+      id-token: write
+      pull-requests: read
+      contents: read
+    steps:
+      - name: Configure Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      - name: Checkout head commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build the package
+        run: npm run build
+
+      - name: Run integration tests
+        run: npx vitest run --project integ-node test/integ/session-manager.test.node.ts
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-integ-session
+          path: ./test/.artifacts/
+          retention-days: 4
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  test-telemetry:
+    name: 'Integration tests: telemetry'
+    runs-on: ubuntu-latest
+    needs: [authorization-check, detect-changes]
+    if: needs.detect-changes.outputs.telemetry == 'true'
+    environment: ${{ needs.authorization-check.outputs.approval-env }}
+    permissions:
+      id-token: write
+      pull-requests: read
+      contents: read
+    steps:
+      - name: Configure Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      - name: Checkout head commit
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build the package
+        run: npm run build
+
+      - name: Run integration tests
+        run: npx vitest run --project integ-node test/integ/telemetry.test.node.ts
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-artifacts-integ-telemetry
+          path: ./test/.artifacts/
+          retention-days: 4
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Status gate – single check that branch-protection rules can require.
+  # Passes when every triggered test job succeeds; skipped jobs are OK.
+  # ---------------------------------------------------------------------------
+  run-integration-tests:
+    name: Run integration tests
+    if: always()
+    needs:
+      - authorization-check
+      - detect-changes
+      - test-models
+      - test-mcp
+      - test-tools
+      - test-multiagent
+      - test-agent-core
+      - test-session
+      - test-telemetry
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate results
+        run: |
+          echo "Test job results:"
+          echo "  models:     ${{ needs.test-models.result }}"
+          echo "  mcp:        ${{ needs.test-mcp.result }}"
+          echo "  tools:      ${{ needs.test-tools.result }}"
+          echo "  multiagent: ${{ needs.test-multiagent.result }}"
+          echo "  agent-core: ${{ needs.test-agent-core.result }}"
+          echo "  session:    ${{ needs.test-session.result }}"
+          echo "  telemetry:  ${{ needs.test-telemetry.result }}"
+
+          # Fail if any upstream job failed or was cancelled
+          for result in \
+            "${{ needs.authorization-check.result }}" \
+            "${{ needs.detect-changes.result }}" \
+            "${{ needs.test-models.result }}" \
+            "${{ needs.test-mcp.result }}" \
+            "${{ needs.test-tools.result }}" \
+            "${{ needs.test-multiagent.result }}" \
+            "${{ needs.test-agent-core.result }}" \
+            "${{ needs.test-session.result }}" \
+            "${{ needs.test-telemetry.result }}"; do
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "❌ One or more integration test jobs failed or were cancelled"
+              exit 1
+            fi
+          done
+
+          echo "✅ All integration test jobs passed or were appropriately skipped"
