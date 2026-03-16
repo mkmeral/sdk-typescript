@@ -48,6 +48,48 @@ describe('SlidingWindowConversationManager', () => {
     })
   })
 
+  describe('reduce', () => {
+    it('returns true when tool results are truncated even though message count is unchanged', () => {
+      const manager = new SlidingWindowConversationManager({ shouldTruncateResults: true })
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ToolResultBlock({
+              toolUseId: 'tool-1',
+              status: 'success',
+              content: [new TextBlock('Large tool result content')],
+            }),
+          ],
+        }),
+      ]
+
+      const result = manager.reduce({
+        agent: createMockAgent({ messages }),
+        error: new ContextWindowOverflowError('overflow'),
+      })
+
+      expect(result).toBe(true)
+      expect(messages).toHaveLength(1) // length unchanged, but truncation occurred
+    })
+
+    it('returns true when messages are trimmed', () => {
+      const manager = new SlidingWindowConversationManager({ windowSize: 1, shouldTruncateResults: false })
+      const messages = [
+        new Message({ role: 'user', content: [new TextBlock('Message 1')] }),
+        new Message({ role: 'assistant', content: [new TextBlock('Response 1')] }),
+      ]
+
+      const result = manager.reduce({
+        agent: createMockAgent({ messages }),
+        error: new ContextWindowOverflowError('overflow'),
+      })
+
+      expect(result).toBe(true)
+      expect(messages).toHaveLength(1)
+    })
+  })
+
   describe('applyManagement', () => {
     it('skips reduction when message count is less than window size', async () => {
       const manager = new SlidingWindowConversationManager({ windowSize: 10 })
@@ -224,7 +266,7 @@ describe('SlidingWindowConversationManager', () => {
       ]
 
       // First call should return false (already truncated)
-      const result = (manager as any).truncateToolResults(messages, 0)
+      const result = (manager as any)._truncateToolResults(messages, 0)
       expect(result).toBe(false)
 
       // reduceContext should fall through to message trimming
@@ -272,13 +314,13 @@ describe('SlidingWindowConversationManager', () => {
       ]
       const mockAgent = createMockAgent({ messages })
 
-      // Spy on truncateToolResults to verify it's NOT called
-      const truncateSpy = vi.spyOn(manager as any, 'truncateToolResults')
+      // Spy on _truncateToolResults to verify it's NOT called
+      const truncateSpy = vi.spyOn(manager as any, '_truncateToolResults')
 
       // Trigger window size enforcement (no error parameter)
       await triggerSlidingWindow(manager, mockAgent)
 
-      // Verify truncateToolResults was NOT called during window enforcement
+      // Verify _truncateToolResults was NOT called during window enforcement
       expect(truncateSpy).not.toHaveBeenCalled()
 
       // Should have trimmed to window size (1 message) through message trimming instead
@@ -501,7 +543,30 @@ describe('SlidingWindowConversationManager', () => {
       expect(mockAgent.messages[0]!.content[0]).toEqual({ type: 'textBlock', text: 'Response 1' })
     })
 
-    it('throws ContextWindowOverflowError when no valid trim point exists', async () => {
+    it('returns false when no valid trim point exists', async () => {
+      const manager = new SlidingWindowConversationManager({ windowSize: 0, shouldTruncateResults: false })
+      const messages = [
+        new Message({
+          role: 'user',
+          content: [
+            new ToolResultBlock({
+              toolUseId: 'id-1',
+              status: 'success',
+              content: [new TextBlock('Result')],
+            }),
+          ],
+        }),
+      ]
+
+      const result = manager.reduce({
+        agent: createMockAgent({ messages }),
+        error: new ContextWindowOverflowError('Context overflow'),
+      })
+
+      expect(result).toBe(false)
+    })
+
+    it('propagates the original ContextWindowOverflowError when reduce cannot reduce further', async () => {
       const manager = new SlidingWindowConversationManager({ windowSize: 0, shouldTruncateResults: false })
       const messages = [
         new Message({
@@ -516,10 +581,16 @@ describe('SlidingWindowConversationManager', () => {
         }),
       ]
       const mockAgent = createMockAgent({ messages })
+      const originalError = new ContextWindowOverflowError('Context overflow')
 
-      await expect(
-        triggerContextOverflow(manager, mockAgent, new ContextWindowOverflowError('Context overflow'))
-      ).rejects.toThrow(ContextWindowOverflowError)
+      // The base class hook does not set event.retry when reduce returns false,
+      // so the original error propagates out of the hook chain
+      const event = new AfterModelCallEvent({ agent: mockAgent, error: originalError })
+      const pluginAgent = createMockAgent()
+      manager.initAgent(pluginAgent)
+      await invokeTrackedHook(pluginAgent, event)
+
+      expect(event.retry).toBeUndefined()
     })
   })
 
@@ -542,7 +613,7 @@ describe('SlidingWindowConversationManager', () => {
           new Message({ role: 'assistant', content: [new TextBlock('Response')] }),
         ]
 
-        const index = (manager as any).findLastMessageWithToolResults(messages)
+        const index = (manager as any)._findLastMessageWithToolResults(messages)
         expect(index).toBe(1)
       })
 
@@ -553,7 +624,7 @@ describe('SlidingWindowConversationManager', () => {
           new Message({ role: 'assistant', content: [new TextBlock('Response 1')] }),
         ]
 
-        const index = (manager as any).findLastMessageWithToolResults(messages)
+        const index = (manager as any)._findLastMessageWithToolResults(messages)
         expect(index).toBeUndefined()
       })
 
@@ -583,7 +654,7 @@ describe('SlidingWindowConversationManager', () => {
           }),
         ]
 
-        const index = (manager as any).findLastMessageWithToolResults(messages)
+        const index = (manager as any)._findLastMessageWithToolResults(messages)
         // Should find the last one (index 2), not the first one (index 0)
         expect(index).toBe(2)
       })
@@ -605,7 +676,7 @@ describe('SlidingWindowConversationManager', () => {
           }),
         ]
 
-        const result = (manager as any).truncateToolResults(messages, 0)
+        const result = (manager as any)._truncateToolResults(messages, 0)
         expect(result).toBe(true)
       })
 
@@ -624,7 +695,7 @@ describe('SlidingWindowConversationManager', () => {
           }),
         ]
 
-        const result = (manager as any).truncateToolResults(messages, 0)
+        const result = (manager as any)._truncateToolResults(messages, 0)
         expect(result).toBe(false)
       })
 
@@ -632,7 +703,7 @@ describe('SlidingWindowConversationManager', () => {
         const manager = new SlidingWindowConversationManager()
         const messages = [new Message({ role: 'user', content: [new TextBlock('Message')] })]
 
-        const result = (manager as any).truncateToolResults(messages, 0)
+        const result = (manager as any)._truncateToolResults(messages, 0)
         expect(result).toBe(false)
       })
     })

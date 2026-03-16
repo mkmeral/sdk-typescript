@@ -5,11 +5,11 @@
  * that preserves tool usage pairs and avoids invalid window states.
  */
 
-import { ContextWindowOverflowError } from '../errors.js'
 import { Message, TextBlock, ToolResultBlock } from '../types/messages.js'
-import type { Plugin } from '../plugins/plugin.js'
 import type { AgentData } from '../types/agent.js'
-import { AfterInvocationEvent, AfterModelCallEvent } from '../hooks/events.js'
+import { AfterInvocationEvent } from '../hooks/events.js'
+import { ConversationManager, type ConversationManagerReduceOptions } from './conversation-manager.js'
+import { logger } from '../logging/logger.js'
 
 /**
  * Configuration for the sliding window conversation manager.
@@ -36,20 +36,18 @@ export type SlidingWindowConversationManagerConfig = {
  * the window size, it will either truncate large tool results or remove the oldest
  * messages while ensuring tool use/result pairs remain valid.
  *
- * As a Plugin, it registers callbacks for:
+ * Registers hooks for:
  * - AfterInvocationEvent: Applies sliding window management after each invocation
- * - AfterModelCallEvent: Reduces context on overflow errors and requests retry
+ * - AfterModelCallEvent: Reduces context on overflow errors and requests retry (via super)
  */
-export class SlidingWindowConversationManager implements Plugin {
+export class SlidingWindowConversationManager extends ConversationManager {
   private readonly _windowSize: number
   private readonly _shouldTruncateResults: boolean
 
   /**
-   * Unique identifier for this plugin.
+   * Unique identifier for this conversation manager.
    */
-  get name(): string {
-    return 'strands:sliding-window-conversation-manager'
-  }
+  readonly name = 'strands:sliding-window-conversation-manager'
 
   /**
    * Initialize the sliding window conversation manager.
@@ -57,6 +55,7 @@ export class SlidingWindowConversationManager implements Plugin {
    * @param config - Configuration options for the sliding window manager.
    */
   constructor(config?: SlidingWindowConversationManagerConfig) {
+    super()
     this._windowSize = config?.windowSize ?? 40
     this._shouldTruncateResults = config?.shouldTruncateResults ?? true
   }
@@ -66,40 +65,43 @@ export class SlidingWindowConversationManager implements Plugin {
    *
    * Registers:
    * - AfterInvocationEvent callback to apply sliding window management
-   * - AfterModelCallEvent callback to handle context overflow and request retry
+   * - AfterModelCallEvent callback to handle context overflow and request retry (via super)
    *
    * @param agent - The agent to register hooks with
    */
-  public initAgent(agent: AgentData): void {
-    // Apply sliding window management after each invocation
-    agent.addHook(AfterInvocationEvent, (event) => {
-      this.applyManagement(event.agent.messages)
-    })
+  public override initAgent(agent: AgentData): void {
+    super.initAgent(agent)
 
-    // Handle context overflow errors
-    agent.addHook(AfterModelCallEvent, (event) => {
-      if (event.error instanceof ContextWindowOverflowError) {
-        this.reduceContext(event.agent.messages, event.error)
-        event.retry = true
-      }
+    agent.addHook(AfterInvocationEvent, (event) => {
+      this._applyManagement(event.agent.messages)
     })
+  }
+
+  /**
+   * Reduce the conversation history in response to a context overflow.
+   *
+   * Attempts to truncate large tool results first before falling back to message trimming.
+   *
+   * @param options - The reduction options
+   * @returns `true` if the history was reduced, `false` otherwise
+   */
+  reduce({ agent, error }: ConversationManagerReduceOptions): boolean {
+    return this._reduceContext(agent.messages, error)
   }
 
   /**
    * Apply the sliding window to the messages array to maintain a manageable history size.
    *
-   * This method is called after every agent loop cycle to apply a sliding window if the message
-   * count exceeds the window size. If the number of messages is within the window size, no action
-   * is taken.
+   * Called after every agent invocation. No-op if within the window size.
    *
    * @param messages - The message array to manage. Modified in-place.
    */
-  private applyManagement(messages: Message[]): void {
+  private _applyManagement(messages: Message[]): void {
     if (messages.length <= this._windowSize) {
       return
     }
 
-    this.reduceContext(messages)
+    this._reduceContext(messages, undefined)
   }
 
   /**
@@ -116,17 +118,15 @@ export class SlidingWindowConversationManager implements Plugin {
    *
    * @param messages - The message array to reduce. Modified in-place.
    * @param _error - The error that triggered the context reduction, if any.
-   *
-   * @throws ContextWindowOverflowError If the context cannot be reduced further,
-   *         such as when the conversation is already minimal or when no valid trim point exists.
+   * @returns `true` if any reduction occurred, `false` otherwise.
    */
-  private reduceContext(messages: Message[], _error?: Error): void {
+  private _reduceContext(messages: Message[], _error?: Error): boolean {
     // Only truncate tool results when handling a context overflow error, not for window size enforcement
-    const lastMessageIdxWithToolResults = this.findLastMessageWithToolResults(messages)
+    const lastMessageIdxWithToolResults = this._findLastMessageWithToolResults(messages)
     if (_error && lastMessageIdxWithToolResults !== undefined && this._shouldTruncateResults) {
-      const resultsTruncated = this.truncateToolResults(messages, lastMessageIdxWithToolResults)
+      const resultsTruncated = this._truncateToolResults(messages, lastMessageIdxWithToolResults)
       if (resultsTruncated) {
-        return
+        return true
       }
     }
 
@@ -166,13 +166,17 @@ export class SlidingWindowConversationManager implements Plugin {
       break
     }
 
-    // If we didn't find a valid trim_index, then we throw
+    // If no valid trim point was found, return false and let the caller handle it
     if (trimIndex >= messages.length) {
-      throw new ContextWindowOverflowError('Unable to trim conversation context!')
+      logger.warn(
+        `window_size=<${this._windowSize}>, messages=<${messages.length}> | unable to trim conversation context, no valid trim point found`
+      )
+      return false
     }
 
-    // Overwrite message history
+    // trimIndex is guaranteed to be < messages.length here, so splice always removes at least one message
     messages.splice(0, trimIndex)
+    return true
   }
 
   /**
@@ -185,7 +189,7 @@ export class SlidingWindowConversationManager implements Plugin {
    * @param msgIdx - Index of the message containing tool results to truncate.
    * @returns True if any changes were made to the message, false otherwise.
    */
-  private truncateToolResults(messages: Message[], msgIdx: number): boolean {
+  private _truncateToolResults(messages: Message[], msgIdx: number): boolean {
     if (msgIdx >= messages.length || msgIdx < 0) {
       return false
     }
@@ -251,7 +255,7 @@ export class SlidingWindowConversationManager implements Plugin {
    * @param messages - The conversation message history.
    * @returns Index of the last message with tool results, or undefined if no such message exists.
    */
-  private findLastMessageWithToolResults(messages: Message[]): number | undefined {
+  private _findLastMessageWithToolResults(messages: Message[]): number | undefined {
     // Iterate backwards through all messages (from newest to oldest)
     for (let idx = messages.length - 1; idx >= 0; idx--) {
       const currentMessage = messages[idx]!

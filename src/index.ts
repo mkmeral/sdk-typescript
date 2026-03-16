@@ -206,6 +206,10 @@ export type { HookCallback, HookableEventConstructor, ModelStopResponse, Redacti
 export type { Plugin } from './plugins/index.js'
 
 // Conversation Manager
+export {
+  ConversationManager,
+  type ConversationManagerReduceOptions,
+} from './conversation-manager/conversation-manager.js'
 export { NullConversationManager } from './conversation-manager/null-conversation-manager.js'
 export {
   SlidingWindowConversationManager,
